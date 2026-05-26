@@ -94,26 +94,25 @@ jobs:
           git config --system core.longpaths true
           Write-Host "Long paths enabled (registry + git)"
 
-      - name: Cache CUDA Toolkit install dir
+      - name: Restore CUDA Toolkit cache
         # CUDA install is the slowest non-build step (~5 min: ~3 GB local
         # installer download + extract + driver-registration). Caching the
         # extracted toolchain root cuts this to ~30s on warm runs. Cache
-        # size is ~7 GB; GitHub's per-repo cache budget is 10 GB total —
-        # one entry per cuda_version is fine.
-        # Bumping the trailing -vN forces a fresh cache (use if a CUDA
-        # patch release of the same version starts shipping different
-        # contents and the cached copy goes stale).
-        id: cache-cuda
-        uses: actions/cache@v4
+        # size is ~7 GB; GitHub's per-repo cache budget is 10 GB total.
+        # Bumping the trailing -vN forces a fresh cache.
+        #
+        # Restore/save split: we use the restore action here and the
+        # matching save action AFTER the install step, gated on
+        # `if: always() && cache-hit != 'true'`. `actions/cache@v4`'s
+        # `save-always: true` option is deprecated and (per GitHub's own
+        # warning) "does not work as intended" — the only way to save a
+        # cache when a later step fails is the explicit save action with
+        # `if: always()`.
+        id: cache-cuda-restore
+        uses: actions/cache/restore@v4
         with:
           path: 'C:\Program Files\NVIDIA GPU Computing Toolkit'
           key: cuda-toolkit-${{ inputs.cuda_version }}-v1
-          # Persist the cache even when later steps fail — iter 7 failed
-          # at "Build vllm wheel" and actions/cache's default behavior
-          # SKIPPED the post-job save for all three caches in this job.
-          # We're debugging downstream steps; the upstream CUDA install
-          # always succeeds, so its cache should always be written.
-          save-always: true
 
       - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
         # v0.2.32 first added CUDA 13.2.0 to the version table; v0.2.35 is
@@ -125,12 +124,24 @@ jobs:
         # sub-packages is omitted under method=local — the local installer
         # places everything; we don't need to pick components.
         # Skipped on cache hit; CUDA_PATH is derived in the next step.
-        if: steps.cache-cuda.outputs.cache-hit != 'true'
+        if: steps.cache-cuda-restore.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda
         with:
           cuda: ${{ inputs.cuda_version }}
           method: 'local'
+
+      - name: Save CUDA Toolkit cache
+        # Runs even if a later step fails (`if: always()`), and skipped
+        # when we already restored from cache (cache-hit != 'true' on the
+        # restore step). Placed right after install so the cache is
+        # persisted as soon as it's populated, before any downstream
+        # failure can prevent the save.
+        if: always() && steps.cache-cuda-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: 'C:\Program Files\NVIDIA GPU Computing Toolkit'
+          key: cuda-toolkit-${{ inputs.cuda_version }}-v1
 
       - name: Export CUDA env vars (vLLM CMakeLists reads these)
         shell: pwsh
@@ -189,21 +200,20 @@ jobs:
           echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "vllm-windows at $commit"
 
-      - name: Cache pip wheel cache
+      - name: Restore pip wheel cache
         # Pip caches downloaded wheel files (responses-by-URL) under
         # %LOCALAPPDATA%\pip\Cache by default. ~2-3 GB after a torch nightly
         # install. Cuts the ~2.5 GB torch+vision+audio download portion on
         # same-day reruns (different-day reruns get a new nightly URL and
-        # miss). Bump -vN to invalidate.
-        id: cache-pip
-        uses: actions/cache@v4
+        # miss). Bump -vN to invalidate. Matching save action below.
+        id: cache-pip-restore
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~\AppData\Local\pip\Cache
           key: pip-cache-${{ runner.os }}-cu130-v1
-          save-always: true
 
-      - name: Cache installed torch packages
+      - name: Restore installed torch packages
         # On warm reruns this lets us SKIP the pip install entirely and just
         # restore the installed torch/torchvision/torchaudio packages. The
         # cached nightly date becomes the build target for that cache key —
@@ -211,8 +221,9 @@ jobs:
         # to whatever torch is actually installed.
         # Bump -vN to force a fresh nightly (do this when intentionally
         # picking up a newer torch nightly, e.g., for a CVE fix upstream).
-        id: cache-torch
-        uses: actions/cache@v4
+        # Matching save action below.
+        id: cache-torch-restore
+        uses: actions/cache/restore@v4
         with:
           path: |
             C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch
@@ -231,7 +242,6 @@ jobs:
             C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\mpmath*
             C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\markupsafe*
           key: torch-cu130-${{ runner.os }}-py312-v1
-          save-always: true
 
       - name: Install torch nightly cu130 + build tools
         shell: pwsh
@@ -241,7 +251,7 @@ jobs:
 
           # Skip the torch download/install on cache hit — the restored
           # site-packages already has everything that step would install.
-          if ('${{ steps.cache-torch.outputs.cache-hit }}' -ne 'true') {
+          if ('${{ steps.cache-torch-restore.outputs.cache-hit }}' -ne 'true') {
             python -m pip install --pre `
               --index-url https://download.pytorch.org/whl/nightly/cu130 `
               --extra-index-url https://pypi.org/simple `
@@ -274,6 +284,40 @@ jobs:
           echo "TORCHVISION_VERSION=$tvVer" >> $env:GITHUB_ENV
           echo "TORCHAUDIO_VERSION=$taVer" >> $env:GITHUB_ENV
           Write-Host "Built against torch=$torchVer torchvision=$tvVer torchaudio=$taVer"
+
+      - name: Save pip wheel cache
+        # Runs even on later step failure; skipped if we restored from
+        # cache (cache-hit on the restore step). Placed right after the
+        # install so pip-cache contents are persisted before any
+        # downstream failure.
+        if: always() && steps.cache-pip-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: pip-cache-${{ runner.os }}-cu130-v1
+
+      - name: Save installed torch packages
+        if: always() && steps.cache-torch-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch-*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision-*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio-*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\nvidia
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\sympy*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\networkx*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\jinja2*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\filelock*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\typing_extensions*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\fsspec*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\mpmath*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\markupsafe*
+          key: torch-cu130-${{ runner.os }}-py312-v1
 
       - name: Apply CUDA 13 alignment patch (cuda.h)
         # The README says to run this script before building when the
