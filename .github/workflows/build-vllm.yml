@@ -8,9 +8,15 @@ name: Build vLLM Windows wheel (RTX 5090 / sm_120 / cu130)
 # pins torch==X.Y.Z+cu130 but that nightly rotated off the index"
 # class of resolution failures we kept hitting before.
 #
-# Lineage: matches the build recipe at C:\vllm-windows on the maintainer's
-# machine (SystemPanic/vllm-windows @ 377ffb268 produced
-# vllm-0.20.1.dev7+g377ffb268.cu132-cp312-cp312-win_amd64.whl).
+# Lineage: derived from the maintainer's local build at C:\vllm-windows
+# (SystemPanic/vllm-windows @ 377ffb268 produced
+# vllm-0.20.1.dev7+g377ffb268.cu132-cp312-cp312-win_amd64.whl). The
+# original 377ffb268 SHA was force-pushed off vllm-for-windows and is
+# no longer fetchable via git (GitHub does not enable
+# uploadpack.allowAnySHA1InWant for that repo). We pin instead to the
+# current branch tip 86482f6af — same patch set, 23 commits newer; CI
+# is now the reproducibility anchor (the SHA above just records what
+# the original local-machine build was based on).
 #
 # Cost: vLLM compilation on `windows-latest` runs ~60-90 min including
 # CUDA install. Trigger manually (workflow_dispatch) for occasional
@@ -20,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       vllm_windows_ref:
-        description: 'SystemPanic/vllm-windows ref (tag/branch/commit). Default tracks the original local build.'
+        description: 'SystemPanic/vllm-windows ref (tag/branch/commit). Defaults to current vllm-for-windows tip.'
         required: true
-        default: '377ffb268'
+        default: '86482f6af'
       torch_arch:
         description: 'TORCH_CUDA_ARCH_LIST (Blackwell sm_120 = "12.0"; "12.0+PTX" forward-compat)'
         required: true
@@ -110,12 +116,15 @@ jobs:
           Check-Exit
           cd C:\vllm-windows
 
-          # The pinned SHA `377ffb268` lives on a force-pushed history —
-          # `git compare` reports it as "diverged" from current
-          # vllm-for-windows HEAD (547 ahead / 23 behind). A plain clone
-          # doesn't fetch unreachable commits, so checkout would fail with
-          # "pathspec did not match". Explicit fetch-by-SHA pulls it in;
-          # GitHub allows arbitrary-SHA fetches by default.
+          # Fetch the requested SHA explicitly: plain `git clone` only
+          # populates the default branch's history, and a SHA on a sibling
+          # branch (vllm-for-windows) won't be in the object DB until we
+          # ask for it. GitHub permits SHA fetches as long as the commit
+          # is reachable from SOME ref (uploadpack.allowReachableSHA1InWant,
+          # on by default); the default 86482f6af is the current tip of
+          # vllm-for-windows so this always resolves.
+          git fetch origin vllm-for-windows
+          Check-Exit
           git fetch origin "${{ inputs.vllm_windows_ref }}"
           Check-Exit
           git checkout "${{ inputs.vllm_windows_ref }}"
