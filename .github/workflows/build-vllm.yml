@@ -160,16 +160,69 @@ jobs:
           echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "vllm-windows at $commit"
 
+      - name: Cache pip wheel cache
+        # Pip caches downloaded wheel files (responses-by-URL) under
+        # %LOCALAPPDATA%\pip\Cache by default. ~2-3 GB after a torch nightly
+        # install. Cuts the ~2.5 GB torch+vision+audio download portion on
+        # same-day reruns (different-day reruns get a new nightly URL and
+        # miss). Bump -vN to invalidate.
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: pip-cache-${{ runner.os }}-cu130-v1
+
+      - name: Cache installed torch packages
+        # On warm reruns this lets us SKIP the pip install entirely and just
+        # restore the installed torch/torchvision/torchaudio packages. The
+        # cached nightly date becomes the build target for that cache key —
+        # acceptable because use_existing_torch.py rewrites the wheel's pin
+        # to whatever torch is actually installed.
+        # Bump -vN to force a fresh nightly (do this when intentionally
+        # picking up a newer torch nightly, e.g., for a CVE fix upstream).
+        id: cache-torch
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch-*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision-*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio-*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\nvidia
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\sympy*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\networkx*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\jinja2*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\filelock*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\typing_extensions*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\fsspec*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\mpmath*
+            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\markupsafe*
+          key: torch-cu130-${{ runner.os }}-py312-v1
+
       - name: Install torch nightly cu130 + build tools
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
-          python -m pip install --pre `
-            --index-url https://download.pytorch.org/whl/nightly/cu130 `
-            --extra-index-url https://pypi.org/simple `
-            torch torchvision torchaudio
-          # Standard wheel-build tooling. setuptools-scm is required because
-          # vllm-windows derives its version from git tags.
+
+          # Skip the torch download/install on cache hit — the restored
+          # site-packages already has everything that step would install.
+          if ('${{ steps.cache-torch.outputs.cache-hit }}' -ne 'true') {
+            python -m pip install --pre `
+              --index-url https://download.pytorch.org/whl/nightly/cu130 `
+              --extra-index-url https://pypi.org/simple `
+              torch torchvision torchaudio
+            if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
+          } else {
+            Write-Host "torch cache hit — skipping pip install"
+          }
+
+          # Build tooling — small, fast to install, not worth caching
+          # separately. setuptools-scm is required because vllm-windows
+          # derives its version from git tags.
           python -m pip install build cmake ninja packaging setuptools setuptools-scm wheel
 
           # Snapshot torch version for the release body + later --no-deps
@@ -189,13 +242,14 @@ jobs:
           cd C:\vllm-windows
           python fix_cuda_13_align.py
 
-      - name: Apply CUTLASS MSVC patch
-        # vendored CUTLASS submodule has a few MSVC-incompatible constructs;
-        # this script patches them in place.
-        shell: pwsh
-        run: |
-          cd C:\vllm-windows
-          python fix_cutlass_msvc.py
+      # NOTE: SystemPanic/vllm-windows ships fix_cutlass_msvc.py but it is
+      # NOT part of the README's documented build flow, requires
+      # `sys.argv[1] = <cutlass-source-dir>`, and there's no .gitmodules in
+      # the repo — CUTLASS is fetched by CMake during build, not vendored.
+      # The script appears to be a development-time helper rather than a
+      # build prerequisite. If MSVC chokes on CUTLASS later, we'd need to
+      # run this script post-fetch and mid-build — out of scope for this
+      # workflow's straight-line install.
 
       - name: Switch build to use locally-installed torch (relax version pin)
         # Without this, the wheel's setup.py pins torch to the EXACT version
