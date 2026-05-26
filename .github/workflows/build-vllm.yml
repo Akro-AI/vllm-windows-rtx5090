@@ -222,14 +222,27 @@ jobs:
 
           # Build tooling — small, fast to install, not worth caching
           # separately. setuptools-scm is required because vllm-windows
-          # derives its version from git tags.
-          python -m pip install build cmake ninja packaging setuptools setuptools-scm wheel
+          # derives its version from git tags. setuptools is upper-bounded
+          # because vllm's pyproject.toml pins `setuptools<81.0.0,>=77.0.3`
+          # and `python -m build --no-isolation` will hard-fail with
+          # "Missing dependencies: setuptools<81.0.0,>=77.0.3" if we have
+          # 81+ installed (default pip pulls latest, currently 81.x).
+          python -m pip install build cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-scm wheel
 
-          # Snapshot torch version for the release body + later --no-deps
-          # download of the matching wheels.
+          # Snapshot versions for the release body + later --no-deps
+          # download. Capture all three: torch / torchvision / torchaudio.
+          # Pinning only torch is a silent bug — `pip download torchvision`
+          # without a version resolves to whatever's newest on the nightly
+          # index, which on a different nightly date has a different torch
+          # ABI than the one we built against. The whole point of the
+          # bundle is shipping a mutually-consistent triple.
           $torchVer = python -c "import torch; print(torch.__version__)"
+          $tvVer    = python -c "import torchvision; print(torchvision.__version__)"
+          $taVer    = python -c "import torchaudio; print(torchaudio.__version__)"
           echo "TORCH_VERSION=$torchVer" >> $env:GITHUB_ENV
-          Write-Host "Built against torch=$torchVer"
+          echo "TORCHVISION_VERSION=$tvVer" >> $env:GITHUB_ENV
+          echo "TORCHAUDIO_VERSION=$taVer" >> $env:GITHUB_ENV
+          Write-Host "Built against torch=$torchVer torchvision=$tvVer torchaudio=$taVer"
 
       - name: Apply CUDA 13 alignment patch (cuda.h)
         # The README says to run this script before building when the
@@ -291,7 +304,9 @@ jobs:
             --extra-index-url https://pypi.org/simple `
             --no-deps `
             --dest C:\stage `
-            "torch==$env:TORCH_VERSION" torchvision torchaudio
+            "torch==$env:TORCH_VERSION" `
+            "torchvision==$env:TORCHVISION_VERSION" `
+            "torchaudio==$env:TORCHAUDIO_VERSION"
 
           Get-ChildItem C:\stage | Sort-Object Name | Format-Table Name, Length -AutoSize
           $wheels = (Get-ChildItem C:\stage -Filter *.whl | ForEach-Object { $_.Name }) -join "`n  - "
@@ -329,13 +344,14 @@ jobs:
             | CUDA Toolkit | ${{ inputs.cuda_version }} |
             | Target arch | `${{ inputs.torch_arch }}` (Blackwell sm_120) |
             | Torch | `${{ env.TORCH_VERSION }}` (nightly cu130) |
+            | Torchvision | `${{ env.TORCHVISION_VERSION }}` |
+            | Torchaudio | `${{ env.TORCHAUDIO_VERSION }}` |
             | Build command | `python -m build --wheel --no-isolation` |
             | Toolchain | MSVC (VS 2022) + ninja |
 
-            Pre-build patches applied (all from upstream vllm-windows tree):
+            Pre-build patches applied (from upstream vllm-windows tree):
             - `fix_cuda_13_align.py` — patches CUDA 13.0-13.2 cuda.h 128-byte alignment that MSVC chokes on
-            - `fix_cutlass_msvc.py` — vendored CUTLASS submodule MSVC fixes
-            - `use_existing_torch.py` — replaces hardcoded torch pin with the runtime-installed version, so the published wheel doesn't lock to a torch nightly that's already rotated off PyPI
+            - `use_existing_torch.py` — rewrites the wheel's exact torch pin (originally `torch==2.11.0`) to match the runtime-installed nightly, so the published wheel doesn't lock to a torch nightly that's already rotated off the index
 
             FA3 (Hopper-only) build skipped (`VLLM_FORCE_FA3_WINDOWS_BUILD=0`); NCCL deferred (see Open issues below).
 
