@@ -71,6 +71,21 @@ jobs:
         with:
           arch: x64
 
+      - name: Cache CUDA Toolkit install dir
+        # CUDA install is the slowest non-build step (~5 min: ~3 GB local
+        # installer download + extract + driver-registration). Caching the
+        # extracted toolchain root cuts this to ~30s on warm runs. Cache
+        # size is ~7 GB; GitHub's per-repo cache budget is 10 GB total —
+        # one entry per cuda_version is fine.
+        # Bumping the trailing -vN forces a fresh cache (use if a CUDA
+        # patch release of the same version starts shipping different
+        # contents and the cached copy goes stale).
+        id: cache-cuda
+        uses: actions/cache@v4
+        with:
+          path: 'C:\Program Files\NVIDIA GPU Computing Toolkit'
+          key: cuda-toolkit-${{ inputs.cuda_version }}-v1
+
       - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
         # v0.2.32 first added CUDA 13.2.0 to the version table; v0.2.35 is
         # latest as of writing.
@@ -80,6 +95,8 @@ jobs:
         # CUDA 13.x line. Trade-off: larger download (~3 GB) but reliable.
         # sub-packages is omitted under method=local — the local installer
         # places everything; we don't need to pick components.
+        # Skipped on cache hit; CUDA_PATH is derived in the next step.
+        if: steps.cache-cuda.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda
         with:
@@ -89,7 +106,17 @@ jobs:
       - name: Export CUDA env vars (vLLM CMakeLists reads these)
         shell: pwsh
         run: |
-          $cuda = "${{ steps.cuda.outputs.CUDA_PATH }}"
+          # On cache hit the Jimver action didn't run, so its CUDA_PATH
+          # output is empty. Derive from the install dir directly — there's
+          # only one version installed under the toolkit root.
+          $cudaFromAction = "${{ steps.cuda.outputs.CUDA_PATH }}"
+          if ($cudaFromAction) {
+            $cuda = $cudaFromAction
+          } else {
+            $cuda = (Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory `
+                     | Sort-Object Name -Descending | Select-Object -First 1).FullName
+            Write-Host "Restored from cache: CUDA_PATH=$cuda"
+          }
           echo "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
           echo "CUDA_HOME=$cuda" >> $env:GITHUB_ENV
           echo "CUDA_ROOT=$cuda" >> $env:GITHUB_ENV
