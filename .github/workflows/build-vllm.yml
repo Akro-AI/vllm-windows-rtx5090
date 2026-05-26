@@ -94,13 +94,34 @@ jobs:
       - name: Clone SystemPanic/vllm-windows @ ${{ inputs.vllm_windows_ref }}
         shell: pwsh
         run: |
+          # PowerShell does NOT exit on native command failure by default —
+          # without this, a failed `git checkout` silently no-ops and the
+          # next step builds against the wrong tree.
+          $ErrorActionPreference = 'Stop'
+          function Check-Exit { if ($LASTEXITCODE -ne 0) { throw "command exited $LASTEXITCODE" } }
+
           # Top-level clone path matches the maintainer's local checkout
           # (C:\vllm-windows). Some fix scripts may reference absolute paths
           # in error messages — keeping the path consistent reduces drift.
-          git clone --recurse-submodules https://github.com/SystemPanic/vllm-windows.git C:\vllm-windows
+          # Clone WITHOUT --recurse-submodules: submodule init runs against
+          # the default branch, but we then checkout a different commit and
+          # need to re-sync against that commit's submodule pins.
+          git clone https://github.com/SystemPanic/vllm-windows.git C:\vllm-windows
+          Check-Exit
           cd C:\vllm-windows
+
+          # The pinned SHA `377ffb268` lives on a force-pushed history —
+          # `git compare` reports it as "diverged" from current
+          # vllm-for-windows HEAD (547 ahead / 23 behind). A plain clone
+          # doesn't fetch unreachable commits, so checkout would fail with
+          # "pathspec did not match". Explicit fetch-by-SHA pulls it in;
+          # GitHub allows arbitrary-SHA fetches by default.
+          git fetch origin "${{ inputs.vllm_windows_ref }}"
+          Check-Exit
           git checkout "${{ inputs.vllm_windows_ref }}"
+          Check-Exit
           git submodule update --init --recursive
+          Check-Exit
           $commit = git rev-parse --short HEAD
           echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "vllm-windows at $commit"
