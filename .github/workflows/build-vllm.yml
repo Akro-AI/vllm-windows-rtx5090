@@ -85,6 +85,12 @@ jobs:
         with:
           path: 'C:\Program Files\NVIDIA GPU Computing Toolkit'
           key: cuda-toolkit-${{ inputs.cuda_version }}-v1
+          # Persist the cache even when later steps fail — iter 7 failed
+          # at "Build vllm wheel" and actions/cache's default behavior
+          # SKIPPED the post-job save for all three caches in this job.
+          # We're debugging downstream steps; the upstream CUDA install
+          # always succeeds, so its cache should always be written.
+          save-always: true
 
       - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
         # v0.2.32 first added CUDA 13.2.0 to the version table; v0.2.35 is
@@ -172,6 +178,7 @@ jobs:
           path: |
             ~\AppData\Local\pip\Cache
           key: pip-cache-${{ runner.os }}-cu130-v1
+          save-always: true
 
       - name: Cache installed torch packages
         # On warm reruns this lets us SKIP the pip install entirely and just
@@ -201,6 +208,7 @@ jobs:
             C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\mpmath*
             C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\markupsafe*
           key: torch-cu130-${{ runner.os }}-py312-v1
+          save-always: true
 
       - name: Install torch nightly cu130 + build tools
         shell: pwsh
