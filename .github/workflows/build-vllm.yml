@@ -67,14 +67,18 @@ jobs:
 
       - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
         # v0.2.32 first added CUDA 13.2.0 to the version table; v0.2.35 is
-        # latest as of writing. Older v0.2.19 only knew up through CUDA 12.x
-        # which made the input "13.0.0" / "13.2.0" return "Version not available".
+        # latest as of writing.
+        # method: 'local' downloads the full offline installer + extracts —
+        # 'network' (component-streaming) has been crashing the NVIDIA
+        # installer with exit code 0xE0CB1799 on windows-latest for the
+        # CUDA 13.x line. Trade-off: larger download (~3 GB) but reliable.
+        # sub-packages is omitted under method=local — the local installer
+        # places everything; we don't need to pick components.
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda
         with:
           cuda: ${{ inputs.cuda_version }}
-          method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "cudart_dev", "nvml_dev", "nvrtc_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "curand", "curand_dev", "cufft", "cufft_dev"]'
+          method: 'local'
 
       - name: Export CUDA env vars (vLLM CMakeLists reads these)
         shell: pwsh
