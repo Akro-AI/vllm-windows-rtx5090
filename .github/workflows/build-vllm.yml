@@ -71,6 +71,29 @@ jobs:
         with:
           arch: x64
 
+      - name: Enable Windows long paths
+        # vLLM-windows' README step #6 (directly above the build commands)
+        # requires this. The build fetches Composable Kernel sources whose
+        # tensor_operation_instance/gpu/<gemm-variant>/<deeply-nested-name>
+        # paths blow past Windows' classic 260-char MAX_PATH inside
+        # CMake's build dir.
+        # Two flips:
+        #   1. Registry LongPathsEnabled — flips per-process opt-in to ON
+        #      for any app that checks it at startup (modern git, cmake,
+        #      python file APIs). Effective immediately for processes
+        #      spawned after this step; no reboot needed.
+        #   2. git core.longpaths=true — git's own internal cap, separate
+        #      from the OS flag.
+        # Without these, iter 8 failed mid-compile with hundreds of
+        # `error: unable to create file ...: Filename too long`.
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          git config --global core.longpaths true
+          git config --system core.longpaths true
+          Write-Host "Long paths enabled (registry + git)"
+
       - name: Cache CUDA Toolkit install dir
         # CUDA install is the slowest non-build step (~5 min: ~3 GB local
         # installer download + extract + driver-registration). Caching the
