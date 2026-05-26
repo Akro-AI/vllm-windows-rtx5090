@@ -1,0 +1,253 @@
+name: Build vLLM Windows wheel (RTX 5090 / sm_120 / cu130)
+
+# Builds vLLM as a native Windows wheel from the SystemPanic/vllm-windows
+# fork (the canonical Windows port with MSVC + CUDA-13 patches). Ships
+# both the vllm wheel AND the exact torch / torchvision / torchaudio
+# nightlies it was built against — consumers install all four with
+# --no-deps and skip pip / uv resolution entirely. Avoids the "wheel
+# pins torch==X.Y.Z+cu130 but that nightly rotated off the index"
+# class of resolution failures we kept hitting before.
+#
+# Lineage: matches the build recipe at C:\vllm-windows on the maintainer's
+# machine (SystemPanic/vllm-windows @ 377ffb268 produced
+# vllm-0.20.1.dev7+g377ffb268.cu132-cp312-cp312-win_amd64.whl).
+#
+# Cost: vLLM compilation on `windows-latest` runs ~60-90 min including
+# CUDA install. Trigger manually (workflow_dispatch) for occasional
+# rebuilds.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_windows_ref:
+        description: 'SystemPanic/vllm-windows ref (tag/branch/commit). Default tracks the original local build.'
+        required: true
+        default: '377ffb268'
+      torch_arch:
+        description: 'TORCH_CUDA_ARCH_LIST (Blackwell sm_120 = "12.0"; "12.0+PTX" forward-compat)'
+        required: true
+        default: '12.0+PTX'
+      cuda_version:
+        description: 'CUDA Toolkit version. 13.0+ needed for sm_120; 13.2 was the original build target.'
+        required: true
+        default: '13.0.0'
+      release_tag:
+        description: 'Release tag for the published wheels (e.g., vllm-0.20.1.dev7-cu130-py312-win-amd64-sm120)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180  # generous: CUDA install + vllm compile
+    env:
+      # Build env per SystemPanic/vllm-windows README:
+      DISTUTILS_USE_SDK: '1'
+      VLLM_TARGET_DEVICE: 'cuda'
+      MAX_JOBS: '4'  # windows-latest has 4 cores; over-subscription thrashes
+      # FA3 is irrelevant on Windows (no Hopper). Keep the build short.
+      VLLM_FORCE_FA3_WINDOWS_BUILD: '0'
+
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure MSVC dev env
+        # windows-latest ships VS 2022 with C++ tools; this action plumbs
+        # the env vars (INCLUDE, LIB, PATH) so cl.exe + nmake are
+        # discoverable by setuptools + ninja. Equivalent to running
+        # `vcvarsall.bat x64` from cmd, which the source README calls out.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA Toolkit ${{ inputs.cuda_version }}
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda
+        with:
+          cuda: ${{ inputs.cuda_version }}
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "cudart_dev", "nvml_dev", "nvrtc_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "curand", "curand_dev", "cufft", "cufft_dev"]'
+
+      - name: Export CUDA env vars (vLLM CMakeLists reads these)
+        shell: pwsh
+        run: |
+          $cuda = "${{ steps.cuda.outputs.CUDA_PATH }}"
+          echo "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          echo "CUDA_HOME=$cuda" >> $env:GITHUB_ENV
+          echo "CUDA_ROOT=$cuda" >> $env:GITHUB_ENV
+          echo "$cuda\bin" >> $env:GITHUB_PATH
+          echo "TORCH_CUDA_ARCH_LIST=${{ inputs.torch_arch }}" >> $env:GITHUB_ENV
+          & "$cuda\bin\nvcc.exe" --version
+
+      - name: Clone SystemPanic/vllm-windows @ ${{ inputs.vllm_windows_ref }}
+        shell: pwsh
+        run: |
+          # Top-level clone path matches the maintainer's local checkout
+          # (C:\vllm-windows). Some fix scripts may reference absolute paths
+          # in error messages — keeping the path consistent reduces drift.
+          git clone --recurse-submodules https://github.com/SystemPanic/vllm-windows.git C:\vllm-windows
+          cd C:\vllm-windows
+          git checkout "${{ inputs.vllm_windows_ref }}"
+          git submodule update --init --recursive
+          $commit = git rev-parse --short HEAD
+          echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
+          Write-Host "vllm-windows at $commit"
+
+      - name: Install torch nightly cu130 + build tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --pre `
+            --index-url https://download.pytorch.org/whl/nightly/cu130 `
+            --extra-index-url https://pypi.org/simple `
+            torch torchvision torchaudio
+          # Standard wheel-build tooling. setuptools-scm is required because
+          # vllm-windows derives its version from git tags.
+          python -m pip install build cmake ninja packaging setuptools setuptools-scm wheel
+
+          # Snapshot torch version for the release body + later --no-deps
+          # download of the matching wheels.
+          $torchVer = python -c "import torch; print(torch.__version__)"
+          echo "TORCH_VERSION=$torchVer" >> $env:GITHUB_ENV
+          Write-Host "Built against torch=$torchVer"
+
+      - name: Apply CUDA 13 alignment patch (cuda.h)
+        # The README says to run this script before building when the
+        # installed CUDA is 13.0 - 13.2 (13.3 reverts the breaking
+        # alignment change). Script writes to the CUDA installation dir
+        # so the runner's CUDA must be writable — `Jimver/cuda-toolkit`
+        # installs to a runner-owned path, so no admin elevation needed.
+        shell: pwsh
+        run: |
+          cd C:\vllm-windows
+          python fix_cuda_13_align.py
+
+      - name: Apply CUTLASS MSVC patch
+        # vendored CUTLASS submodule has a few MSVC-incompatible constructs;
+        # this script patches them in place.
+        shell: pwsh
+        run: |
+          cd C:\vllm-windows
+          python fix_cutlass_msvc.py
+
+      - name: Switch build to use locally-installed torch (relax version pin)
+        # Without this, the wheel's setup.py pins torch to the EXACT version
+        # the maintainer originally built against (e.g. 2.11.0+cu130), and
+        # PyTorch's nightly index rotates daily so that pin is unreachable
+        # in days. use_existing_torch.py rewrites the pin to match the
+        # currently-installed torch — same goal as our earlier --override
+        # hack at install time, done once at build time instead.
+        shell: pwsh
+        run: |
+          cd C:\vllm-windows
+          python use_existing_torch.py
+
+      - name: Build vllm wheel
+        shell: pwsh
+        working-directory: C:\vllm-windows
+        run: |
+          # `pip install . --no-build-isolation --no-deps` matches the
+          # maintainer's command from buildlogs.txt. --no-build-isolation
+          # is mandatory: an isolated build env would re-resolve torch and
+          # likely pick the wrong CUDA flavor. --no-deps avoids pulling
+          # transitive deps we ship separately.
+          #
+          # But pip install builds + installs; we want the wheel only.
+          # Use python -m build instead which only produces dist/*.whl.
+          python -m build --wheel --no-isolation
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize
+
+      - name: Stage wheels (vllm + matching torch triple)
+        shell: pwsh
+        run: |
+          mkdir C:\stage
+          Copy-Item C:\vllm-windows\dist\*.whl C:\stage\
+          # Re-download the EXACT torch nightlies we built against. They're
+          # already cached but `pip download` writes the wheel files we can
+          # publish as release assets.
+          python -m pip download --pre `
+            --index-url https://download.pytorch.org/whl/nightly/cu130 `
+            --extra-index-url https://pypi.org/simple `
+            --no-deps `
+            --dest C:\stage `
+            "torch==$env:TORCH_VERSION" torchvision torchaudio
+
+          Get-ChildItem C:\stage | Sort-Object Name | Format-Table Name, Length -AutoSize
+          $wheels = (Get-ChildItem C:\stage -Filter *.whl | ForEach-Object { $_.Name }) -join "`n  - "
+          echo "WHEEL_LIST<<EOF" >> $env:GITHUB_ENV
+          echo "  - $wheels" >> $env:GITHUB_ENV
+          echo "EOF" >> $env:GITHUB_ENV
+
+      - name: Compute SHA-256 for each wheel (release body)
+        id: sha
+        shell: pwsh
+        run: |
+          $shas = Get-ChildItem C:\stage -Filter *.whl | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "  - ``$($_.Name)``: ``$h``"
+          }
+          $body = $shas -join "`n"
+          echo "SHA_LINES<<EOF" >> $env:GITHUB_ENV
+          echo "$body" >> $env:GITHUB_ENV
+          echo "EOF" >> $env:GITHUB_ENV
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: C:\stage\*.whl
+          body: |
+            vLLM Windows wheel built from `SystemPanic/vllm-windows@${{ env.VLLM_COMMIT }}` (input ref: `${{ inputs.vllm_windows_ref }}`).
+
+            ## Build environment
+
+            | | |
+            |---|---|
+            | Runner | `windows-latest` (GitHub-hosted) |
+            | Python | 3.12 |
+            | CUDA Toolkit | ${{ inputs.cuda_version }} |
+            | Target arch | `${{ inputs.torch_arch }}` (Blackwell sm_120) |
+            | Torch | `${{ env.TORCH_VERSION }}` (nightly cu130) |
+            | Build command | `python -m build --wheel --no-isolation` |
+            | Toolchain | MSVC (VS 2022) + ninja |
+
+            Pre-build patches applied (all from upstream vllm-windows tree):
+            - `fix_cuda_13_align.py` — patches CUDA 13.0-13.2 cuda.h 128-byte alignment that MSVC chokes on
+            - `fix_cutlass_msvc.py` — vendored CUTLASS submodule MSVC fixes
+            - `use_existing_torch.py` — replaces hardcoded torch pin with the runtime-installed version, so the published wheel doesn't lock to a torch nightly that's already rotated off PyPI
+
+            FA3 (Hopper-only) build skipped (`VLLM_FORCE_FA3_WINDOWS_BUILD=0`); NCCL deferred (see Open issues below).
+
+            ## Assets
+
+            ${{ env.WHEEL_LIST }}
+
+            ### SHA-256 sums
+
+            ${{ env.SHA_LINES }}
+
+            ## Consumer install
+
+            Install all four wheels together with `--no-deps` to bypass pip
+            / uv resolution. They were built as a unit — version drift between
+            them at install time will not happen.
+
+            ```powershell
+            uv pip install --python <venv-python> --no-deps `
+              vllm-*.whl torch-*.whl torchvision-*.whl torchaudio-*.whl
+            ```
+
+            ## Open issues
+
+            - NCCL: SystemPanic/vllm-windows recommends building NCCL from
+              `SystemPanic/nccl-windows` and pointing `VLLM_NCCL_SO_PATH`
+              at the resulting `nccl.dll`. Not bundled in this workflow yet
+              — single-GPU inference doesn't exercise NCCL at runtime, but
+              tensor-parallel / multi-GPU inference will fail without it.
+              Follow-up: add a sibling `build-nccl.yml` workflow and
+              bundle the .dll here.
