@@ -115,20 +115,27 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           function Check-Exit { if ($LASTEXITCODE -ne 0) { throw "command exited $LASTEXITCODE" } }
-          # Fresh clone into the CI dir (self-hosted workspaces persist;
-          # never reuse a possibly-dirty tree). Does NOT touch any manual
-          # C:\vllm-windows checkout.
-          if (Test-Path $env:VLLM_SRC) { Remove-Item -Recurse -Force $env:VLLM_SRC }
-          git clone https://github.com/SystemPanic/vllm-windows.git $env:VLLM_SRC
-          Check-Exit
-          cd $env:VLLM_SRC
-          git fetch origin vllm-for-windows
-          Check-Exit
-          git checkout "${{ inputs.vllm_windows_ref }}"
-          Check-Exit
-          git submodule update --init --recursive
-          Check-Exit
-          $commit = git rev-parse --short HEAD
+          # DEBUG-MODE REUSE: self-hosted workspaces persist, and we no longer
+          # delete C:\vllm-windows-ci in cleanup — so if the checkout already
+          # exists we REUSE it (keeps the CMake build/ dir for incremental
+          # recompiles + any built wheel). Delete C:\vllm-windows-ci by hand
+          # to force a clean clone. Never touches the manual C:\vllm-windows.
+          if (Test-Path "$env:VLLM_SRC\.git") {
+            Write-Host "Reusing existing checkout at $env:VLLM_SRC (not re-cloning)"
+            cd $env:VLLM_SRC
+            $commit = git rev-parse --short HEAD
+          } else {
+            git clone https://github.com/SystemPanic/vllm-windows.git $env:VLLM_SRC
+            Check-Exit
+            cd $env:VLLM_SRC
+            git fetch origin vllm-for-windows
+            Check-Exit
+            git checkout "${{ inputs.vllm_windows_ref }}"
+            Check-Exit
+            git submodule update --init --recursive
+            Check-Exit
+            $commit = git rev-parse --short HEAD
+          }
           echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "vllm-windows at $commit"
 
@@ -141,14 +148,20 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $faCmake = "$env:VLLM_SRC\cmake\external_projects\vllm_flash_attn.cmake"
           $content = Get-Content $faCmake -Raw
-          $anchor = '    if(TARGET ${_fa_tgt})'
-          if (-not $content.Contains($anchor)) {
-            throw "FA cmake anchor not found — upstream changed vllm_flash_attn.cmake; re-derive the patch"
-          }
           $inject = '      set_target_properties(${_fa_tgt} PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20)'
-          $content = $content.Replace($anchor, ($anchor + "`n" + $inject))
-          Set-Content $faCmake -Value $content -NoNewline
-          Write-Host "Patched FA targets to C++20 / CUDA C++20"
+          # Idempotent: on a reused checkout the patch is already applied, so
+          # skip rather than double-inserting.
+          if ($content.Contains($inject)) {
+            Write-Host "FA C++20 patch already applied — skipping"
+          } else {
+            $anchor = '    if(TARGET ${_fa_tgt})'
+            if (-not $content.Contains($anchor)) {
+              throw "FA cmake anchor not found — upstream changed vllm_flash_attn.cmake; re-derive the patch"
+            }
+            $content = $content.Replace($anchor, ($anchor + "`n" + $inject))
+            Set-Content $faCmake -Value $content -NoNewline
+            Write-Host "Patched FA targets to C++20 / CUDA C++20"
+          }
 
       - name: Install torch nightly cu130 + build tools
         # Always a full install (the box's persistent pip cache serves the
@@ -158,19 +171,22 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
+          # torchaudio is NOT installed: vLLM doesn't need it for our models
+          # (PaddleOCR-VL parser + Qwen3 chat — no audio), and a stale
+          # torchaudio==2.11.0+cpu in the box's persistent Python broke the
+          # earlier staging download (it isn't on the cu130 index). torch +
+          # torchvision are all vLLM needs (vision for PaddleOCR-VL).
           python -m pip install --pre `
             --index-url https://download.pytorch.org/whl/nightly/cu130 `
             --extra-index-url https://pypi.org/simple `
-            torch torchvision torchaudio
+            torch torchvision
           if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
           python -m pip install build cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-scm wheel
           $torchVer = python -c "import torch; print(torch.__version__)"
           $tvVer    = python -c "import torchvision; print(torchvision.__version__)"
-          $taVer    = python -c "import torchaudio; print(torchaudio.__version__)"
           echo "TORCH_VERSION=$torchVer" >> $env:GITHUB_ENV
           echo "TORCHVISION_VERSION=$tvVer" >> $env:GITHUB_ENV
-          echo "TORCHAUDIO_VERSION=$taVer" >> $env:GITHUB_ENV
-          Write-Host "Built against torch=$torchVer torchvision=$tvVer torchaudio=$taVer"
+          Write-Host "Built against torch=$torchVer torchvision=$tvVer"
 
       - name: Apply CUDA 13 alignment patch (cuda.h)
         # Idempotent: only rewrites cuda.h when the unpatched 128-byte-align
@@ -196,7 +212,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "wheel build failed" }
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
 
-      - name: Stage wheels (vllm + matching torch triple)
+      - name: Stage wheels (vllm + matching torch/torchvision)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -209,9 +225,8 @@ jobs:
             --no-deps `
             --dest C:\stage `
             "torch==$env:TORCH_VERSION" `
-            "torchvision==$env:TORCHVISION_VERSION" `
-            "torchaudio==$env:TORCHAUDIO_VERSION"
-          if ($LASTEXITCODE -ne 0) { throw "torch triple download failed" }
+            "torchvision==$env:TORCHVISION_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "torch wheel download failed" }
           Get-ChildItem C:\stage | Sort-Object Name | Format-Table Name, Length -AutoSize
           $wheels = (Get-ChildItem C:\stage -Filter *.whl | ForEach-Object { $_.Name }) -join "`n  - "
           echo "WHEEL_LIST<<EOF" >> $env:GITHUB_ENV
@@ -248,7 +263,6 @@ jobs:
             | Target arch | `${{ inputs.torch_arch }}` (Blackwell sm_120) |
             | Torch | `${{ env.TORCH_VERSION }}` (nightly cu130) |
             | Torchvision | `${{ env.TORCHVISION_VERSION }}` |
-            | Torchaudio | `${{ env.TORCHAUDIO_VERSION }}` |
             | MAX_JOBS | `${{ inputs.max_jobs }}` |
 
             ## Assets
@@ -259,14 +273,13 @@ jobs:
 
             ${{ env.SHA_LINES }}
 
-            Install all four together with `--no-deps` (or `uv sync` against
-            the local wheels) to bypass pip/uv resolution against the
-            rotating torch nightly index.
+            Install the three wheels together with `--no-deps` (or `uv sync`
+            against the local wheels) to bypass pip/uv resolution against the
+            rotating torch nightly index. torchaudio is not bundled (vLLM
+            doesn't need it for text/vision models).
 
-      - name: Cleanup
-        if: always()
-        shell: pwsh
-        run: |
-          # Reclaim the large clone + stage dirs (self-hosted persists).
-          if (Test-Path $env:VLLM_SRC) { Remove-Item -Recurse -Force $env:VLLM_SRC }
-          if (Test-Path C:\stage)     { Remove-Item -Recurse -Force C:\stage }
+      # NOTE: no Cleanup step while debugging — C:\vllm-windows-ci (source +
+      # CMake build/ + dist/*.whl) and C:\stage are intentionally LEFT in
+      # place so reruns reuse the checkout (incremental recompile) and the
+      # built wheel survives a later-step failure. Re-add a cleanup step,
+      # or delete those dirs by hand, once the pipeline is stable.
