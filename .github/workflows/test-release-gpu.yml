@@ -88,17 +88,18 @@ jobs:
 
           $torch = (Get-ChildItem wheels\torch-*.whl).FullName
           $tv    = (Get-ChildItem wheels\torchvision-*.whl).FullName
-          $ta    = (Get-ChildItem wheels\torchaudio-*.whl).FullName
           $vllm  = (Get-ChildItem wheels\vllm-*.whl).FullName
 
-          # Install all four local wheels in one resolve so the torch== pins
-          # in vision/audio/vllm are satisfied by the bundled torch, and let
-          # uv pull vLLM's pure-Python transitive deps (cbor2, fastapi, …)
-          # from PyPI + the nightly index. This is the full runtime install
-          # that real inference requires (vs. Tier-1's --no-deps import test).
+          # Install the three local wheels in one resolve so torchvision's /
+          # vllm's torch== pins bind to the bundled torch, and let uv pull
+          # vLLM's pure-Python transitive deps (cbor2, fastapi, …) from PyPI +
+          # the nightly index. Full runtime install (vs. Tier-1's --no-deps
+          # import test). torchaudio is not in the bundle — vLLM doesn't need
+          # it.
           uv pip install --python .venv --pre `
+            --index-strategy unsafe-best-match `
             --extra-index-url https://download.pytorch.org/whl/nightly/cu130 `
-            $torch $tv $ta $vllm
+            $torch $tv $vllm
           if ($LASTEXITCODE -ne 0) { throw "wheel install failed" }
 
       - name: GPU inference smoke test
