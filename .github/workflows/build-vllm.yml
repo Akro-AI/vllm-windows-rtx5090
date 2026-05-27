@@ -260,53 +260,27 @@ jobs:
             ~\AppData\Local\pip\Cache
           key: pip-cache-${{ runner.os }}-cu130-v1
 
-      - name: Restore installed torch packages
-        # On warm reruns this lets us SKIP the pip install entirely and just
-        # restore the installed torch/torchvision/torchaudio packages. The
-        # cached nightly date becomes the build target for that cache key —
-        # acceptable because use_existing_torch.py rewrites the wheel's pin
-        # to whatever torch is actually installed.
-        # Bump -vN to force a fresh nightly (do this when intentionally
-        # picking up a newer torch nightly, e.g., for a CVE fix upstream).
-        # Matching save action below.
-        id: cache-torch-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch-*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision-*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio-*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\nvidia
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\sympy*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\networkx*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\jinja2*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\filelock*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\typing_extensions*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\fsspec*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\mpmath*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\markupsafe*
-          key: torch-cu130-${{ runner.os }}-py312-v1
-
       - name: Install torch nightly cu130 + build tools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
 
-          # Skip the torch download/install on cache hit — the restored
-          # site-packages already has everything that step would install.
-          if ('${{ steps.cache-torch-restore.outputs.cache-hit }}' -ne 'true') {
-            python -m pip install --pre `
-              --index-url https://download.pytorch.org/whl/nightly/cu130 `
-              --extra-index-url https://pypi.org/simple `
-              torch torchvision torchaudio
-            if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
-          } else {
-            Write-Host "torch cache hit — skipping pip install"
-          }
+          # ALWAYS run the install — do NOT cache/skip the installed
+          # site-packages. iter 11 failed with `ModuleNotFoundError: No
+          # module named 'torchgen'` after a selective-glob site-packages
+          # cache "hit" restored torch/ but not torchgen/ (and other
+          # torch-adjacent top-level packages + numpy). You can't reliably
+          # hand-enumerate everything torch drags in, so caching installed
+          # packages by glob produces a broken-but-present environment.
+          # Instead we cache only the pip WHEEL cache (above): the slow part
+          # is the ~2.5 GB download, and pip serves it from disk on warm
+          # reruns while still doing a complete, consistent install here.
+          python -m pip install --pre `
+            --index-url https://download.pytorch.org/whl/nightly/cu130 `
+            --extra-index-url https://pypi.org/simple `
+            torch torchvision torchaudio
+          if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
 
           # Build tooling — small, fast to install, not worth caching
           # separately. setuptools-scm is required because vllm-windows
@@ -343,28 +317,6 @@ jobs:
           path: |
             ~\AppData\Local\pip\Cache
           key: pip-cache-${{ runner.os }}-cu130-v1
-
-      - name: Save installed torch packages
-        if: always() && steps.cache-torch-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torch-*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchvision-*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\torchaudio-*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\nvidia
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\sympy*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\networkx*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\jinja2*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\filelock*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\typing_extensions*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\fsspec*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\mpmath*
-            C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\site-packages\markupsafe*
-          key: torch-cu130-${{ runner.os }}-py312-v1
 
       - name: Apply CUDA 13 alignment patch (cuda.h)
         # The README says to run this script before building when the
