@@ -200,6 +200,54 @@ jobs:
           echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "vllm-windows at $commit"
 
+      - name: Patch flash-attn build to C++20 (torch 2.13 headers need it)
+        # Iter 9 compiled for ~1.5h then failed building _vllm_fa2_C:
+        #   torch/include/c10/core/AutogradState.h(89): error C7582:
+        #   'view_replay_enabled_': default member initializers for
+        #   bit-fields requires at least '/std:c++20'
+        #
+        # The torch nightly we build against (2.13.0.dev) has C++20-only
+        # constructs in its public headers. The main vllm-windows project
+        # is already C++20 (CMakeLists sets CMAKE_CXX_STANDARD 20), but the
+        # vllm-flash-attn subproject (FetchContent'd from
+        # vllm-project/flash-attention) overrides the standard to C++17 for
+        # its own targets, so any FA source including torch headers fails.
+        # The maintainer never hit this because torch 2.11.0's headers were
+        # still C++17-clean.
+        #
+        # vllm_flash_attn.cmake already force-overrides compile options on
+        # the FA targets from the parent scope (precisely to defeat the
+        # subproject's overrides). We inject CXX_STANDARD 20 + CUDA_STANDARD
+        # 20 into that same foreach so both the .cpp host compiles and the
+        # .cu host-side compiles pick up C++20. CUDA 13 supports C++20
+        # device code, so CUDA_STANDARD 20 is valid and keeps host/device
+        # standards consistent (avoids the nvcc host/device std-mismatch
+        # that a bare -Xcompiler=/std:c++20 would risk).
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $faCmake = "C:\vllm-windows\cmake\external_projects\vllm_flash_attn.cmake"
+          $content = Get-Content $faCmake -Raw
+          $anchor = @'
+      target_compile_options(${_fa_tgt} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+      )
+'@
+          $replacement = @'
+      target_compile_options(${_fa_tgt} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+      )
+      set_target_properties(${_fa_tgt} PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20)
+'@
+          if (-not $content.Contains($anchor)) {
+            throw "FA cmake anchor not found — upstream changed vllm_flash_attn.cmake; re-derive the patch"
+          }
+          $content = $content.Replace($anchor, $replacement)
+          Set-Content $faCmake -Value $content -NoNewline
+          Write-Host "Patched FA targets to C++20 / CUDA C++20"
+
       - name: Restore pip wheel cache
         # Pip caches downloaded wheel files (responses-by-URL) under
         # %LOCALAPPDATA%\pip\Cache by default. ~2-3 GB after a torch nightly
@@ -330,14 +378,15 @@ jobs:
           cd C:\vllm-windows
           python fix_cuda_13_align.py
 
-      # NOTE: SystemPanic/vllm-windows ships fix_cutlass_msvc.py but it is
-      # NOT part of the README's documented build flow, requires
-      # `sys.argv[1] = <cutlass-source-dir>`, and there's no .gitmodules in
-      # the repo — CUTLASS is fetched by CMake during build, not vendored.
-      # The script appears to be a development-time helper rather than a
-      # build prerequisite. If MSVC chokes on CUTLASS later, we'd need to
-      # run this script post-fetch and mid-build — out of scope for this
-      # workflow's straight-line install.
+      # NOTE: we deliberately do NOT invoke fix_cutlass_msvc.py as a
+      # standalone step. It requires `sys.argv[1] = <cutlass-source-dir>`,
+      # and CUTLASS isn't present until CMake FetchContent pulls it mid-
+      # build. vllm_flash_attn.cmake already calls it automatically during
+      # the build (`execute_process(... fix_cutlass_msvc.py
+      # ${vllm-flash-attn_SOURCE_DIR}/csrc/cutlass)`), so the patch is
+      # applied at the correct point with the correct path. Running it
+      # ourselves at top level (no arg) is what raised the earlier
+      # IndexError.
 
       - name: Switch build to use locally-installed torch (relax version pin)
         # Without this, the wheel's setup.py pins torch to the EXACT version
