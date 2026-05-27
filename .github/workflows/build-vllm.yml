@@ -228,23 +228,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $faCmake = "C:\vllm-windows\cmake\external_projects\vllm_flash_attn.cmake"
           $content = Get-Content $faCmake -Raw
-          $anchor = @'
-      target_compile_options(${_fa_tgt} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
-        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
-      )
-'@
-          $replacement = @'
-      target_compile_options(${_fa_tgt} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
-        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
-      )
-      set_target_properties(${_fa_tgt} PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20)
-'@
+          # Single-line anchor (avoids multi-line here-strings, which break
+          # YAML block-scalar indentation). Insert set_target_properties
+          # immediately after the `if(TARGET ${_fa_tgt})` line inside the
+          # existing foreach over the FA targets. Single quotes keep
+          # ${_fa_tgt} literal (no PowerShell expansion); the newline is
+          # the only thing that needs a double-quoted segment.
+          $anchor = '    if(TARGET ${_fa_tgt})'
           if (-not $content.Contains($anchor)) {
             throw "FA cmake anchor not found — upstream changed vllm_flash_attn.cmake; re-derive the patch"
           }
-          $content = $content.Replace($anchor, $replacement)
+          $inject = '      set_target_properties(${_fa_tgt} PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20)'
+          $content = $content.Replace($anchor, ($anchor + "`n" + $inject))
           Set-Content $faCmake -Value $content -NoNewline
           Write-Host "Patched FA targets to C++20 / CUDA C++20"
 
