@@ -1,0 +1,258 @@
+name: Build vLLM Windows wheel (self-hosted RTX 5090)
+
+# Self-hosted build variant of build-vllm.yml. Same recipe, but runs on the
+# RTX 5090 box where it compiles in a fraction of the time (the 4-core
+# windows-latest hosted runner needs 3h+; a many-core box does it in well
+# under an hour) and reuses the toolchain already installed there.
+#
+# ── Assumptions about the box (all true if you built vLLM locally there) ──
+#   - Visual Studio 2022 with the C++ workload (cl.exe, MSVC headers).
+#   - CUDA Toolkit 13.x already installed (we detect it; we do NOT install).
+#   - Python 3.12 + git on PATH.
+#   - The CUDA 13 cuda.h alignment patch is already applied from your local
+#     build, so fix_cuda_13_align.py is a harmless idempotent no-op here
+#     (it only rewrites cuda.h when the unpatched struct is present, so it
+#     won't try to write into Program Files when already patched).
+#
+# ── Runner setup (one-time, on the box) ──────────────────────────────────
+#   Repo → Settings → Actions → Runners → New self-hosted runner (Windows
+#   x64). The default labels `self-hosted`, `windows`, `x64` are enough —
+#   this job targets `[self-hosted, windows]`. Start run.cmd (or install as
+#   a service). If fix_cuda_13_align.py ever needs to WRITE cuda.h (e.g. a
+#   fresh CUDA install that isn't patched), run the runner elevated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_windows_ref:
+        description: 'SystemPanic/vllm-windows ref (defaults to vllm-for-windows tip).'
+        required: true
+        default: '86482f6af'
+      torch_arch:
+        description: 'TORCH_CUDA_ARCH_LIST (Blackwell sm_120).'
+        required: true
+        default: '12.0+PTX'
+      max_jobs:
+        description: 'Parallel compile jobs. RAM-bound — each nvcc unit can use 2-4 GB; set to ~min(cores, RAM_GB/4).'
+        required: true
+        default: '8'
+      release_tag:
+        description: 'Release tag for the published wheels.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 240
+    env:
+      DISTUTILS_USE_SDK: '1'
+      VLLM_TARGET_DEVICE: 'cuda'
+      MAX_JOBS: ${{ inputs.max_jobs }}
+      VLLM_FORCE_FA3_WINDOWS_BUILD: '0'
+      VLLM_SRC: 'C:\vllm-windows-ci'   # CI clone dir — kept separate from any
+                                       # manual C:\vllm-windows checkout on the box
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure MSVC dev env
+        # Requires VS 2022 + C++ tools on the box (present if you built
+        # locally). Plumbs INCLUDE/LIB/PATH for cl.exe + nmake.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Enable Windows long paths (idempotent)
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          git config --global core.longpaths true
+          git config --system core.longpaths true 2>$null
+          Write-Host "Long paths enabled"
+
+      - name: Detect existing CUDA + export env
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Use the box's already-installed CUDA — no Jimver install. Prefer
+          # $CUDA_PATH; else newest version dir under the standard root.
+          $cuda = $env:CUDA_PATH
+          if (-not $cuda -or -not (Test-Path "$cuda\bin\nvcc.exe")) {
+            $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+            if (-not (Test-Path $root)) { throw "no CUDA toolkit found on this runner" }
+            $cuda = (Get-ChildItem $root -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          }
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc not found under $cuda" }
+          echo "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          echo "CUDA_HOME=$cuda" >> $env:GITHUB_ENV
+          echo "CUDA_ROOT=$cuda" >> $env:GITHUB_ENV
+          echo "$cuda\bin" >> $env:GITHUB_PATH
+          echo "TORCH_CUDA_ARCH_LIST=${{ inputs.torch_arch }}" >> $env:GITHUB_ENV
+          & "$cuda\bin\nvcc.exe" --version
+
+      - name: Clone SystemPanic/vllm-windows @ ${{ inputs.vllm_windows_ref }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Check-Exit { if ($LASTEXITCODE -ne 0) { throw "command exited $LASTEXITCODE" } }
+          # Fresh clone into the CI dir (self-hosted workspaces persist;
+          # never reuse a possibly-dirty tree). Does NOT touch any manual
+          # C:\vllm-windows checkout.
+          if (Test-Path $env:VLLM_SRC) { Remove-Item -Recurse -Force $env:VLLM_SRC }
+          git clone https://github.com/SystemPanic/vllm-windows.git $env:VLLM_SRC
+          Check-Exit
+          cd $env:VLLM_SRC
+          git fetch origin vllm-for-windows
+          Check-Exit
+          git checkout "${{ inputs.vllm_windows_ref }}"
+          Check-Exit
+          git submodule update --init --recursive
+          Check-Exit
+          $commit = git rev-parse --short HEAD
+          echo "VLLM_COMMIT=$commit" >> $env:GITHUB_ENV
+          Write-Host "vllm-windows at $commit"
+
+      - name: Patch flash-attn build to C++20 (torch 2.13 headers need it)
+        # Same patch as the hosted workflow — see build-vllm.yml for the full
+        # rationale. Forces the vllm-flash-attn subproject's targets to C++20
+        # so torch 2.13's bit-field-initializer headers compile.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $faCmake = "$env:VLLM_SRC\cmake\external_projects\vllm_flash_attn.cmake"
+          $content = Get-Content $faCmake -Raw
+          $anchor = '    if(TARGET ${_fa_tgt})'
+          if (-not $content.Contains($anchor)) {
+            throw "FA cmake anchor not found — upstream changed vllm_flash_attn.cmake; re-derive the patch"
+          }
+          $inject = '      set_target_properties(${_fa_tgt} PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20)'
+          $content = $content.Replace($anchor, ($anchor + "`n" + $inject))
+          Set-Content $faCmake -Value $content -NoNewline
+          Write-Host "Patched FA targets to C++20 / CUDA C++20"
+
+      - name: Install torch nightly cu130 + build tools
+        # Always a full install (the box's persistent pip cache serves the
+        # ~2.5 GB download fast on reruns). setuptools pinned <81 per vllm's
+        # build-system.requires.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          python -m pip install --pre `
+            --index-url https://download.pytorch.org/whl/nightly/cu130 `
+            --extra-index-url https://pypi.org/simple `
+            torch torchvision torchaudio
+          if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
+          python -m pip install build cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-scm wheel
+          $torchVer = python -c "import torch; print(torch.__version__)"
+          $tvVer    = python -c "import torchvision; print(torchvision.__version__)"
+          $taVer    = python -c "import torchaudio; print(torchaudio.__version__)"
+          echo "TORCH_VERSION=$torchVer" >> $env:GITHUB_ENV
+          echo "TORCHVISION_VERSION=$tvVer" >> $env:GITHUB_ENV
+          echo "TORCHAUDIO_VERSION=$taVer" >> $env:GITHUB_ENV
+          Write-Host "Built against torch=$torchVer torchvision=$tvVer torchaudio=$taVer"
+
+      - name: Apply CUDA 13 alignment patch (cuda.h)
+        # Idempotent: only rewrites cuda.h when the unpatched 128-byte-align
+        # struct is present. On a box that already built vLLM locally, cuda.h
+        # is already patched, so this is a no-op and won't attempt a write.
+        shell: pwsh
+        run: |
+          cd $env:VLLM_SRC
+          python fix_cuda_13_align.py
+
+      - name: Switch build to use locally-installed torch (relax version pin)
+        shell: pwsh
+        run: |
+          cd $env:VLLM_SRC
+          python use_existing_torch.py
+
+      - name: Build vllm wheel
+        shell: pwsh
+        working-directory: C:\vllm-windows-ci
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m build --wheel --no-isolation
+          if ($LASTEXITCODE -ne 0) { throw "wheel build failed" }
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize
+
+      - name: Stage wheels (vllm + matching torch triple)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path C:\stage) { Remove-Item -Recurse -Force C:\stage }
+          mkdir C:\stage | Out-Null
+          Copy-Item "$env:VLLM_SRC\dist\*.whl" C:\stage\
+          python -m pip download --pre `
+            --index-url https://download.pytorch.org/whl/nightly/cu130 `
+            --extra-index-url https://pypi.org/simple `
+            --no-deps `
+            --dest C:\stage `
+            "torch==$env:TORCH_VERSION" `
+            "torchvision==$env:TORCHVISION_VERSION" `
+            "torchaudio==$env:TORCHAUDIO_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "torch triple download failed" }
+          Get-ChildItem C:\stage | Sort-Object Name | Format-Table Name, Length -AutoSize
+          $wheels = (Get-ChildItem C:\stage -Filter *.whl | ForEach-Object { $_.Name }) -join "`n  - "
+          echo "WHEEL_LIST<<EOF" >> $env:GITHUB_ENV
+          echo "  - $wheels" >> $env:GITHUB_ENV
+          echo "EOF" >> $env:GITHUB_ENV
+
+      - name: Compute SHA-256 for each wheel (release body)
+        shell: pwsh
+        run: |
+          $shas = Get-ChildItem C:\stage -Filter *.whl | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "  - ``$($_.Name)``: ``$h``"
+          }
+          $body = $shas -join "`n"
+          echo "SHA_LINES<<EOF" >> $env:GITHUB_ENV
+          echo "$body" >> $env:GITHUB_ENV
+          echo "EOF" >> $env:GITHUB_ENV
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: C:\stage\*.whl
+          body: |
+            vLLM Windows wheel built from `SystemPanic/vllm-windows@${{ env.VLLM_COMMIT }}` (input ref: `${{ inputs.vllm_windows_ref }}`).
+
+            Built on a **self-hosted RTX 5090 runner** (not GitHub-hosted).
+
+            | | |
+            |---|---|
+            | Runner | self-hosted (`[self-hosted, windows]`) |
+            | Python | 3.12 |
+            | CUDA | detected on-box (`${{ env.CUDA_PATH }}`) |
+            | Target arch | `${{ inputs.torch_arch }}` (Blackwell sm_120) |
+            | Torch | `${{ env.TORCH_VERSION }}` (nightly cu130) |
+            | Torchvision | `${{ env.TORCHVISION_VERSION }}` |
+            | Torchaudio | `${{ env.TORCHAUDIO_VERSION }}` |
+            | MAX_JOBS | `${{ inputs.max_jobs }}` |
+
+            ## Assets
+
+            ${{ env.WHEEL_LIST }}
+
+            ### SHA-256 sums
+
+            ${{ env.SHA_LINES }}
+
+            Install all four together with `--no-deps` (or `uv sync` against
+            the local wheels) to bypass pip/uv resolution against the
+            rotating torch nightly index.
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          # Reclaim the large clone + stage dirs (self-hosted persists).
+          if (Test-Path $env:VLLM_SRC) { Remove-Item -Recurse -Force $env:VLLM_SRC }
+          if (Test-Path C:\stage)     { Remove-Item -Recurse -Force C:\stage }
