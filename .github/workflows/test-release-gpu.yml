@@ -1,0 +1,119 @@
+name: Test vLLM release on GPU (self-hosted RTX 5090, Tier-2)
+
+# Tier-2 GPU smoke test: runs on a SELF-HOSTED runner with the RTX 5090, so
+# it can do what the GPU-less hosted Tier-1 (test-release.yml) cannot —
+# actually load a model and generate tokens, validating the sm_120 build
+# executes real inference end to end.
+#
+# ── Runner setup (one-time, on the RTX 5090 Windows box) ──────────────────
+#   1. Repo → Settings → Actions → Runners → New self-hosted runner (Windows
+#      x64). Follow the registration steps.
+#   2. When prompted for labels, add: gpu  (and optionally rtx5090).
+#      The default `self-hosted` + `windows` + `x64` labels are added
+#      automatically; this job targets `[self-hosted, windows, gpu]`.
+#   3. Ensure on the box: NVIDIA driver supporting CUDA 13, Python 3.12, and
+#      `uv` on PATH (https://docs.astral.sh/uv/). The torch wheel bundles the
+#      CUDA runtime DLLs, so no separate CUDA toolkit is needed at runtime.
+#   4. Run the runner (`run.cmd`) or install it as a service.
+#
+# Trigger is workflow_dispatch only by default: a `release: published`
+# trigger would QUEUE indefinitely whenever the box is offline. Enable the
+# release trigger below only if the runner is always-on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to test (blank = latest release)'
+        required: false
+      model:
+        description: 'Model to load (blank = tiny default Qwen2.5-0.5B-Instruct)'
+        required: false
+  # release:
+  #   types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-smoke:
+    runs-on: [self-hosted, windows, gpu]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (for gpu_smoke.py)
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ github.event_name }}' -eq 'release') {
+            $tag = '${{ github.event.release.tag_name }}'
+          } elseif ('${{ inputs.release_tag }}') {
+            $tag = '${{ inputs.release_tag }}'
+          } else {
+            $tag = gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q '.tagName'
+          }
+          if (-not $tag) { throw "could not resolve a release tag to test" }
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Testing release: $tag"
+
+      - name: Download release wheels
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path wheels) { Remove-Item -Recurse -Force wheels }
+          mkdir wheels | Out-Null
+          gh release download '${{ steps.tag.outputs.tag }}' `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern '*.whl' `
+            --dir wheels
+          if ($LASTEXITCODE -ne 0) { throw "release download failed" }
+          Get-ChildItem wheels | Format-Table Name, Length -AutoSize
+
+      - name: Fresh venv + install wheels WITH deps (real inference needs them)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Self-hosted workspaces persist between runs — start from a clean
+          # venv every time so a stale install can't mask a regression.
+          if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
+          uv venv --python 3.12 .venv
+          if ($LASTEXITCODE -ne 0) { throw "uv venv failed" }
+
+          $torch = (Get-ChildItem wheels\torch-*.whl).FullName
+          $tv    = (Get-ChildItem wheels\torchvision-*.whl).FullName
+          $ta    = (Get-ChildItem wheels\torchaudio-*.whl).FullName
+          $vllm  = (Get-ChildItem wheels\vllm-*.whl).FullName
+
+          # Install all four local wheels in one resolve so the torch== pins
+          # in vision/audio/vllm are satisfied by the bundled torch, and let
+          # uv pull vLLM's pure-Python transitive deps (cbor2, fastapi, …)
+          # from PyPI + the nightly index. This is the full runtime install
+          # that real inference requires (vs. Tier-1's --no-deps import test).
+          uv pip install --python .venv --pre `
+            --extra-index-url https://download.pytorch.org/whl/nightly/cu130 `
+            $torch $tv $ta $vllm
+          if ($LASTEXITCODE -ne 0) { throw "wheel install failed" }
+
+      - name: GPU inference smoke test
+        shell: pwsh
+        env:
+          GPU_SMOKE_MODEL: ${{ inputs.model }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .venv\Scripts\python.exe .github\scripts\gpu_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw "GPU smoke test failed" }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          # Self-hosted runners don't auto-clean; reclaim the venv + wheels.
+          if (Test-Path .venv)  { Remove-Item -Recurse -Force .venv }
+          if (Test-Path wheels) { Remove-Item -Recurse -Force wheels }
