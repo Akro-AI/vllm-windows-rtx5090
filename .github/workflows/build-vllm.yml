@@ -2,7 +2,7 @@ name: Build vLLM Windows wheel (RTX 5090 / sm_120 / cu130)
 
 # Builds vLLM as a native Windows wheel from the SystemPanic/vllm-windows
 # fork (the canonical Windows port with MSVC + CUDA-13 patches). Ships
-# both the vllm wheel AND the exact torch / torchvision / torchaudio
+# both the vllm wheel AND the exact torch / torchvision
 # nightlies it was built against — consumers install all four with
 # --no-deps and skip pip / uv resolution entirely. Avoids the "wheel
 # pins torch==X.Y.Z+cu130 but that nightly rotated off the index"
@@ -276,10 +276,13 @@ jobs:
           # Instead we cache only the pip WHEEL cache (above): the slow part
           # is the ~2.5 GB download, and pip serves it from disk on warm
           # reruns while still doing a complete, consistent install here.
+          # torchaudio is NOT installed/shipped — vLLM doesn't need it for
+          # text/vision models (no audio), and dropping it avoids the stale
+          # torchaudio==2.11.0+cpu staging mismatch we hit before.
           python -m pip install --pre `
             --index-url https://download.pytorch.org/whl/nightly/cu130 `
             --extra-index-url https://pypi.org/simple `
-            torch torchvision torchaudio
+            torch torchvision
           if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
 
           # Build tooling — small, fast to install, not worth caching
@@ -292,19 +295,16 @@ jobs:
           python -m pip install build cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-scm wheel
 
           # Snapshot versions for the release body + later --no-deps
-          # download. Capture all three: torch / torchvision / torchaudio.
-          # Pinning only torch is a silent bug — `pip download torchvision`
-          # without a version resolves to whatever's newest on the nightly
-          # index, which on a different nightly date has a different torch
-          # ABI than the one we built against. The whole point of the
-          # bundle is shipping a mutually-consistent triple.
+          # download. Capture both — pinning only torch is a silent bug:
+          # `pip download torchvision` without a version resolves to
+          # whatever's newest on the nightly index, which on a different
+          # nightly date has a different torch ABI than the one we built
+          # against. The bundle ships a mutually-consistent torch+torchvision.
           $torchVer = python -c "import torch; print(torch.__version__)"
           $tvVer    = python -c "import torchvision; print(torchvision.__version__)"
-          $taVer    = python -c "import torchaudio; print(torchaudio.__version__)"
           echo "TORCH_VERSION=$torchVer" >> $env:GITHUB_ENV
           echo "TORCHVISION_VERSION=$tvVer" >> $env:GITHUB_ENV
-          echo "TORCHAUDIO_VERSION=$taVer" >> $env:GITHUB_ENV
-          Write-Host "Built against torch=$torchVer torchvision=$tvVer torchaudio=$taVer"
+          Write-Host "Built against torch=$torchVer torchvision=$tvVer"
 
       - name: Save pip wheel cache
         # Runs even on later step failure; skipped if we restored from
@@ -366,7 +366,7 @@ jobs:
           python -m build --wheel --no-isolation
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
 
-      - name: Stage wheels (vllm + matching torch triple)
+      - name: Stage wheels (vllm + matching torch/torchvision)
         shell: pwsh
         run: |
           mkdir C:\stage
@@ -380,8 +380,7 @@ jobs:
             --no-deps `
             --dest C:\stage `
             "torch==$env:TORCH_VERSION" `
-            "torchvision==$env:TORCHVISION_VERSION" `
-            "torchaudio==$env:TORCHAUDIO_VERSION"
+            "torchvision==$env:TORCHVISION_VERSION"
 
           Get-ChildItem C:\stage | Sort-Object Name | Format-Table Name, Length -AutoSize
           $wheels = (Get-ChildItem C:\stage -Filter *.whl | ForEach-Object { $_.Name }) -join "`n  - "
@@ -420,7 +419,6 @@ jobs:
             | Target arch | `${{ inputs.torch_arch }}` (Blackwell sm_120) |
             | Torch | `${{ env.TORCH_VERSION }}` (nightly cu130) |
             | Torchvision | `${{ env.TORCHVISION_VERSION }}` |
-            | Torchaudio | `${{ env.TORCHAUDIO_VERSION }}` |
             | Build command | `python -m build --wheel --no-isolation` |
             | Toolchain | MSVC (VS 2022) + ninja |
 
@@ -440,13 +438,14 @@ jobs:
 
             ## Consumer install
 
-            Install all four wheels together with `--no-deps` to bypass pip
-            / uv resolution. They were built as a unit — version drift between
-            them at install time will not happen.
+            Install the three wheels together (let your resolver bind
+            torchvision's torch== pin to the bundled torch). They were built
+            as a unit. torchaudio is not shipped — vLLM doesn't need it for
+            text/vision models.
 
             ```powershell
-            uv pip install --python <venv-python> --no-deps `
-              vllm-*.whl torch-*.whl torchvision-*.whl torchaudio-*.whl
+            uv pip install --python <venv-python> `
+              vllm-*.whl torch-*.whl torchvision-*.whl
             ```
 
             ## Open issues
