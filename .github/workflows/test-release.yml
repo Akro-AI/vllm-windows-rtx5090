@@ -1,0 +1,99 @@
+name: Test vLLM Windows release (install + import smoke test)
+
+# Tier-1 smoke test: fires automatically when build-vllm.yml publishes a
+# release, and can be run manually against any tag. Installs the published
+# wheels on a clean windows-latest runner and asserts the native
+# extensions load (torch triple ABI + vllm._C DLL). GPU-less, so it does
+# NOT exercise inference — see .github/scripts/smoke_import.py for scope.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to test (blank on dispatch = latest release)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (for smoke_import.py)
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve release tag
+        id: tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ github.event_name }}' -eq 'release') {
+            $tag = '${{ github.event.release.tag_name }}'
+          } elseif ('${{ inputs.release_tag }}') {
+            $tag = '${{ inputs.release_tag }}'
+          } else {
+            $tag = gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q '.tagName'
+          }
+          if (-not $tag) { throw "could not resolve a release tag to test" }
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Testing release: $tag"
+
+      - name: Download release wheels
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          mkdir wheels | Out-Null
+          gh release download '${{ steps.tag.outputs.tag }}' `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern '*.whl' `
+            --dir wheels
+          if ($LASTEXITCODE -ne 0) { throw "release download failed" }
+          Get-ChildItem wheels | Format-Table Name, Length -AutoSize
+
+      - name: Install wheels
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+
+          $torch = (Get-ChildItem wheels\torch-*.whl).FullName
+          $tv    = (Get-ChildItem wheels\torchvision-*.whl).FullName
+          $ta    = (Get-ChildItem wheels\torchaudio-*.whl).FullName
+          $vllm  = (Get-ChildItem wheels\vllm-*.whl).FullName
+
+          # Install the torch triple from the local wheels in one command so
+          # torchvision/torchaudio's exact torch== pins are satisfied by the
+          # bundled torch wheel rather than re-resolved from the index. Pure-
+          # Python deps (sympy, networkx, jinja2, ...) come from the nightly
+          # index + PyPI; torch's CUDA runtime DLLs are bundled inside the
+          # Windows torch wheel itself, so they're present without a GPU.
+          python -m pip install `
+            --pre `
+            --extra-index-url https://download.pytorch.org/whl/nightly/cu130 `
+            $torch $tv $ta
+          if ($LASTEXITCODE -ne 0) { throw "torch triple install failed" }
+
+          # vLLM without deps — we only need _C to load, not vLLM's full
+          # runtime dependency closure (validated downstream, not here).
+          python -m pip install --no-deps $vllm
+          if ($LASTEXITCODE -ne 0) { throw "vllm install failed" }
+
+      - name: Import smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .github\scripts\smoke_import.py
+          if ($LASTEXITCODE -ne 0) { throw "smoke test failed" }
