@@ -17,8 +17,10 @@ import sys
 
 # Small, broadly-supported model. Override via env to test the real
 # production models (Qwen3 AWQ-4bit chat, PaddleOCR-VL parser) on demand.
-MODEL = os.environ.get("GPU_SMOKE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-GPU_MEM = float(os.environ.get("GPU_SMOKE_GPU_MEM", "0.5"))
+# Use `or` (not get's default) so an empty env var — which the workflow
+# sets when the optional `model` input is omitted — falls back too.
+MODEL = os.environ.get("GPU_SMOKE_MODEL") or "Qwen/Qwen2.5-0.5B-Instruct"
+GPU_MEM = float(os.environ.get("GPU_SMOKE_GPU_MEM") or "0.5")
 
 
 def main() -> int:
