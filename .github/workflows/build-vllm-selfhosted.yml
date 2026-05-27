@@ -67,14 +67,28 @@ jobs:
         with:
           arch: x64
 
-      - name: Enable Windows long paths (idempotent)
+      - name: Verify Windows long paths (fail early if missing)
+        # READ-ONLY check (no admin needed) — does NOT try to enable it.
+        # vLLM's Composable-Kernel source paths exceed Windows' 260-char
+        # MAX_PATH, so long paths is mandatory. We verify rather than set:
+        # the box was configured once for the local build, and writing the
+        # HKLM key needs admin (the runner is non-admin). Fail fast with an
+        # actionable message if it's somehow not enabled, rather than
+        # compiling for an hour only to hit "Filename too long".
         shell: pwsh
         run: |
-          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
-            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
-          git config --global core.longpaths true
-          git config --system core.longpaths true 2>$null
-          Write-Host "Long paths enabled"
+          $ErrorActionPreference = 'Stop'
+          $lp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+                   -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
+          if ($lp -ne 1) {
+            throw "LongPathsEnabled is '$lp', expected 1. Enable it once in an ELEVATED shell: " +
+                  "New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force"
+          }
+          $gl = git config --global --get core.longpaths
+          if ($gl -ne 'true') {
+            throw "git core.longpaths (global) is '$gl', expected 'true'. Run: git config --global core.longpaths true"
+          }
+          Write-Host "Long paths OK (registry LongPathsEnabled=1, git global core.longpaths=true)"
 
       - name: Detect existing CUDA + export env
         shell: pwsh
