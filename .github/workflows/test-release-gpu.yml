@@ -102,14 +102,25 @@ jobs:
             $torch $tv $vllm
           if ($LASTEXITCODE -ne 0) { throw "wheel install failed" }
 
-      - name: GPU inference smoke test
+      - name: GPU inference smoke test (chat)
         shell: pwsh
         env:
           GPU_SMOKE_MODEL: ${{ inputs.model }}
         run: |
           $ErrorActionPreference = 'Stop'
           .venv\Scripts\python.exe .github\scripts\gpu_smoke.py
-          if ($LASTEXITCODE -ne 0) { throw "GPU smoke test failed" }
+          if ($LASTEXITCODE -ne 0) { throw "GPU chat smoke test failed" }
+
+      - name: GPU OCR smoke test (PaddleOCR-VL)
+        # Loads the real fast-mode parser VLM, renders an image with known
+        # text, and runs a multimodal generate — validates the production
+        # parser runs on this wheel/GPU. Separate python process so the chat
+        # model's VRAM is freed first.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .venv\Scripts\python.exe .github\scripts\gpu_smoke_ocr.py
+          if ($LASTEXITCODE -ne 0) { throw "GPU OCR smoke test failed" }
 
       - name: Cleanup
         if: always()
