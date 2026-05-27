@@ -47,7 +47,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 180  # generous: CUDA install + vllm compile
+    timeout-minutes: 350  # vllm compile (flash-attn + CK/CUTLASS GEMM for sm_120)
+                          # exceeds 3h on the 4-core windows-latest runner
+                          # (MAX_JOBS=4). iter 10 timed out at 180 mid-compile.
+                          # 350 is under GitHub's 6h hosted-runner hard cap;
+                          # warm CUDA+torch caches keep most of that for compile.
     env:
       # Build env per SystemPanic/vllm-windows README:
       DISTUTILS_USE_SDK: '1'
