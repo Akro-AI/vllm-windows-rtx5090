@@ -33,9 +33,8 @@ print("torch:", torch.__version__)
 import torchvision  # noqa: E402
 
 print("torchvision:", torchvision.__version__)
-import torchaudio  # noqa: E402
-
-print("torchaudio:", torchaudio.__version__)
+# torchaudio is intentionally not in the bundle (vLLM doesn't need it for
+# text/vision models), so we don't import it here.
 
 site = sysconfig.get_paths()["purelib"]
 vllm_dir = os.path.join(site, "vllm")

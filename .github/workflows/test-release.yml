@@ -71,20 +71,20 @@ jobs:
 
           $torch = (Get-ChildItem wheels\torch-*.whl).FullName
           $tv    = (Get-ChildItem wheels\torchvision-*.whl).FullName
-          $ta    = (Get-ChildItem wheels\torchaudio-*.whl).FullName
           $vllm  = (Get-ChildItem wheels\vllm-*.whl).FullName
 
-          # Install the torch triple from the local wheels in one command so
-          # torchvision/torchaudio's exact torch== pins are satisfied by the
-          # bundled torch wheel rather than re-resolved from the index. Pure-
-          # Python deps (sympy, networkx, jinja2, ...) come from the nightly
-          # index + PyPI; torch's CUDA runtime DLLs are bundled inside the
-          # Windows torch wheel itself, so they're present without a GPU.
+          # Install torch + torchvision from the local wheels in one command
+          # so torchvision's exact torch== pin is satisfied by the bundled
+          # torch wheel rather than re-resolved from the index. Pure-Python
+          # deps (sympy, networkx, jinja2, ...) come from the nightly index +
+          # PyPI; torch's CUDA runtime DLLs are bundled inside the Windows
+          # torch wheel itself, so they're present without a GPU. (torchaudio
+          # is not in the bundle — vLLM doesn't need it.)
           python -m pip install `
             --pre `
             --extra-index-url https://download.pytorch.org/whl/nightly/cu130 `
-            $torch $tv $ta
-          if ($LASTEXITCODE -ne 0) { throw "torch triple install failed" }
+            $torch $tv
+          if ($LASTEXITCODE -ne 0) { throw "torch install failed" }
 
           # vLLM without deps — we only need _C to load, not vLLM's full
           # runtime dependency closure (validated downstream, not here).
