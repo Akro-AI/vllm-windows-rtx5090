@@ -369,23 +369,28 @@ jobs:
           #
           # But pip install builds + installs; we want the wheel only.
           # Use python -m build instead which only produces dist/*.whl.
-          # /FI cmath on every cl.exe, via the CL environment variable.
+          # /FI cmath on the C++ and CUDA compiles, via the variables CMake
+          # itself reads at first configure.
           #
           # CUTLASS's tools/util/include/cutlass/util/reference/host/tensor_fill.h
           # uses NAN without including <cmath>. gcc supplies it transitively and
           # MSVC does not, so 0.22's newer CUTLASS fails an hour into the compile
           # with "error C3861: 'NAN': identifier not found" on three call sites.
+          # CUTLASS arrives via FetchContent during configure, so there is no
+          # source on disk to patch beforehand — a compiler flag is the lever.
           #
-          # CL, not CMAKE_CXX_FLAGS: cl.exe reads CL itself, before any build
-          # system is involved, so it survives vllm's setup.py assembling its own
-          # cmake_args and passing -DCMAKE_CXX_FLAGS= explicitly — which is what
-          # silently dropped the flags in run 33630019178, failing on the same
-          # three lines 82 minutes in. nvcc shells out to cl.exe for the host
-          # pass, so the CUDA TUs pick it up too.
-          #
-          # CUTLASS arrives via FetchContent during cmake configure, so patching
-          # the header before the build starts is not an option.
-          $env:CL = "$env:CL /FI cmath"
+          # CXXFLAGS/CUDAFLAGS, and the two spellings that did not work are worth
+          # recording because both look right:
+          #   * CMAKE_CXX_FLAGS as an env var does nothing — CMake seeds
+          #     CMAKE_CXX_FLAGS from CXXFLAGS, not from its own name (run
+          #     33630019178 failed on the same three lines 82 minutes in).
+          #   * CL applies to C as well as C++, so cmath lands in CMake's C
+          #     compiler probe and ucrt/stdlib.h redefines under it — configure
+          #     dies with C2084 before any target builds (run 33638354335, 6 min).
+          # vllm's setup.py passes no -DCMAKE_CXX_FLAGS of its own, so these seed
+          # cleanly.
+          $env:CXXFLAGS  = "$env:CXXFLAGS /FI cmath"
+          $env:CUDAFLAGS = "$env:CUDAFLAGS -Xcompiler /FI -Xcompiler cmath"
 
           python -m build --wheel --no-isolation
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
