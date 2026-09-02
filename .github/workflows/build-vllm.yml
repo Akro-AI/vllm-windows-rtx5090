@@ -292,7 +292,13 @@ jobs:
           # and `python -m build --no-isolation` will hard-fail with
           # "Missing dependencies: setuptools<81.0.0,>=77.0.3" if we have
           # 81+ installed (default pip pulls latest, currently 81.x).
-          python -m pip install build cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-scm wheel
+          # setuptools-rust: vLLM grew a Rust frontend at 0.22, so its build
+          # backend now asks for it in get_requires_for_build_wheel. We build
+          # with `--no-isolation`, which means every backend requirement has to
+          # be present here — without it the build dies in under a minute with
+          # "ModuleNotFoundError: No module named 'setuptools_rust'", long
+          # before any compilation starts.
+          python -m pip install build cmake ninja packaging "setuptools>=77.0.3,<81.0.0" setuptools-rust setuptools-scm wheel
 
           # Snapshot versions for the release body + later --no-deps
           # download. Capture both — pinning only torch is a silent bug:
