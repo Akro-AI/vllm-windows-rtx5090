@@ -369,6 +369,18 @@ jobs:
           #
           # But pip install builds + installs; we want the wheel only.
           # Use python -m build instead which only produces dist/*.whl.
+          # /FI cmath on the MSVC host compiler. CUTLASS's
+          # tools/util/include/cutlass/util/reference/host/tensor_fill.h uses
+          # NAN without including <cmath>; gcc gets it transitively, MSVC does
+          # not, so 0.22's newer CUTLASS fails ~50 min into the compile with
+          # "error C3861: 'NAN': identifier not found" across three call sites.
+          # A forced include is the only lever available: CUTLASS arrives via
+          # FetchContent during cmake configure, so there is nothing on disk to
+          # patch before the build starts. -Xcompiler carries it through nvcc to
+          # the host pass, which is where those TUs are compiled.
+          $env:CMAKE_CXX_FLAGS  = "$env:CMAKE_CXX_FLAGS /FI`"cmath`""
+          $env:CMAKE_CUDA_FLAGS = "$env:CMAKE_CUDA_FLAGS -Xcompiler /FI`"cmath`""
+
           python -m build --wheel --no-isolation
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
 
