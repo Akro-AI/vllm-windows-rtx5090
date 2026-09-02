@@ -389,8 +389,11 @@ jobs:
           #     dies with C2084 before any target builds (run 33638354335, 6 min).
           # vllm's setup.py passes no -DCMAKE_CXX_FLAGS of its own, so these seed
           # cleanly.
-          $env:CXXFLAGS  = "$env:CXXFLAGS /FI cmath"
-          $env:CUDAFLAGS = "$env:CUDAFLAGS -Xcompiler /FI -Xcompiler cmath"
+          #   * CUDAFLAGS with -Xcompiler: nvcc forwards `/FI` and `cmath` as two
+          #     separate arguments, and CMake's CUDA compiler probe dies the same
+          #     C2084 way (run 33639190974, 5 min). CXX only — tensor_fill.h is a
+          #     host header and its three call sites compile on the host pass.
+          $env:CXXFLAGS = "$env:CXXFLAGS /FI cmath"
 
           python -m build --wheel --no-isolation
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
